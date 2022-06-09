@@ -8,12 +8,14 @@ use std::error::Error;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
+use std::rc::Rc;
 
 use actix_web;
 use actix_web::{web, get, post, delete};
 
 use anyhow;
 
+use smoltcp;
 use smoltcp::iface;
 use smoltcp::phy;
 use smoltcp::socket;
@@ -25,6 +27,8 @@ use tokio::io::Interest;
 use tokio::sync::mpsc;
 
 //use tokio_smoltcp::device;
+
+use ya_relay_stack;
 
 struct Connection {
     acceptor: tokio::task::JoinHandle<()>,
@@ -100,64 +104,6 @@ impl ConnectionManager {
  * VPN adapter
  */
 
-// TODO(?) tokio_smoltcp::device::ChannelCapture
-async fn interface_handler(rx: mpsc::Receiver<Vec<u8>>) {
-    let ethernet_addr = wire::EthernetAddress([0xb0, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5]);
-    let ip_addrs = [
-        wire::IpCidr::new(wire::IpAddress::v4(10, 5, 6, 1), 24),
-    ];
-
-//  let mut routes_storage = [None; 1];
-//  let mut routes = Routes::new(&mut routes_storage[..]);
-//  routes.add_default_ipv4_route(wire::Ipv4Address::new(10, 5, 6, 254)).unwrap();
-
-    let neighbor_cache = iface::NeighborCache::new(std::collections::BTreeMap::new());
-
-    let device = phy::TunTapInterface::new("proxy", phy::Medium::Ethernet)
-        .expect("TODO add error handling");
-    let fd = device.as_raw_fd();
-    let iface = iface::InterfaceBuilder::new(device, vec![])
-        .ip_addrs(ip_addrs)
-        .hardware_addr(ethernet_addr.into())
-        .neighbor_cache(neighbor_cache)
-        .finalize();
-
-    let tcp_handle = iface.add_socket(socket::TcpSocket::new(
-        socket::TcpSocketBuffer::new(vec![0; 64]),
-        socket::TcpSocketBuffer::new(vec![0; 128]),
-    ));
-
-    let (socket, cx) = iface.get_socket_and_context::<tcp::Socket>(tcp_handle);
-    socket.connect(cx, (10.5.6.254, 6789), 45678).unwrap();
-    let mut tcp_is_active = false;
-
-    loop {
-        let timestamp = smoltcp::time::Instant::now();
-        iface.poll(timestamp).expect("poll error");
-        let socket = iface.get_socket::<smoltcp::socket::TcpSocket>(tcp_handle);
-
-        if socket.is_active() && !tcp_is_active {
-            debug!("connected");
-        } else if !socket.is_active() && tcp_is_active {
-            debug!("disconnected");
-            break;
-        }
-        tcp_is_active = socket.is_active();
-
-        if !socket.may_send() {
-            debug!("connection closed by peer");
-            break;
-        }
-
-        if socket.can_send() {
-            // non-empty send buffer
-            socket.send_slice()
-        }
-
-        phy::wait(fd, iface.poll_delay(timestamp)).expect("wait error");
-    }
-}
-
 
 //async fn sender(&iface) {
 //  let tcp_handle = iface.add_socket(socket::TcpSocket::new(
@@ -195,13 +141,52 @@ async fn metrics(data: web::Data<Mutex<ConnectionManager>>) -> String {
     ", 1, 2)
 }
 
+// old get interface (plain smoltcp)
+/*
+    let ethernet_addr = wire::EthernetAddress([0xb0, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5]);
+    let ip_addrs = [
+        wire::IpCidr::new(wire::IpAddress::v4(10, 5, 6, 1), 24),
+    ];
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let (mpsc_tx, mpsc_rx) = mpsc::channel(100);
-    let jh_iface = tokio::spawn(interface_handler(mpsc_rx));
+//  let mut routes_storage = [None; 1];
+//  let mut routes = Routes::new(&mut routes_storage[..]);
+//  routes.add_default_ipv4_route(wire::Ipv4Address::new(10, 5, 6, 254)).unwrap();
+
+    let neighbor_cache = iface::NeighborCache::new(std::collections::BTreeMap::new());
+
+    let device = phy::TunTapInterface::new("proxy", phy::Medium::Ethernet)
+        .expect("TODO add error handling");
+    let fd = device.as_raw_fd();
+
+    let iface = iface::InterfaceBuilder::new(device, vec![])
+        .ip_addrs(ip_addrs)
+        .hardware_addr(ethernet_addr.into())
+        .neighbor_cache(neighbor_cache)
+        .finalize();
+*/
+
+#[actix_web::main]
+async fn main() {
+//  let (mpsc_tx, mpsc_rx) = mpsc::channel(100);
+//  let jh_iface = tokio::spawn(interface_handler(mpsc_rx));
+
+    let hwaddr = wire::HardwareAddress::Ethernet(wire::EthernetAddress([0xb0, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5]));
+    let iface = ya_relay_stack::interface::tap_iface(hwaddr, 1280);
+
+    let netconfig = Rc::new(ya_relay_stack::NetworkConfig {
+        max_transmission_unit: 1280,
+        buffer_size_multiplier: 32,
+    });
+
+    let net = ya_relay_stack::Network::new(
+        "proxy",
+        netconfig.clone(),
+        ya_relay_stack::Stack::new(iface, netconfig));
+
+    net.spawn_local();
 
     let data = web::Data::new(Mutex::new(ConnectionManager::new()));
+
     actix_web::HttpServer::new(move || {
         actix_web::App::new()
             .app_data(data.clone())
@@ -211,6 +196,5 @@ async fn main() -> anyhow::Result<()> {
     })
     .bind(("127.0.0.1", 8000)).expect("failet do bind()")
     .run()
-    .await?;
-    Ok(())
+    .await.expect("await failed");
 }
