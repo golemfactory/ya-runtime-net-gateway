@@ -1,21 +1,29 @@
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use actix::{Actor, ActorResponse, Addr, AsyncContext, Context, Handler, Message, WrapFuture};
+use actix::{Actor, Addr};
 use actix_rt::System;
 use clap::Parser;
-use futures::channel::mpsc;
-use futures::future::Either;
+use futures::channel::oneshot;
 use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{oneshot, RwLock};
-use tokio_tun::{Tun, TunBuilder};
 
-use ya_net_gateway::net::{ConnectionChannels, Error, EssentialChannels, Result, VirtualNetwork};
+use ya_net_gateway::error::{Error, Result};
+use ya_net_gateway::net::virt::{Channel, ConnectionChannels, VirtualNetworkConfig};
+use ya_net_gateway::net::{Connect, Network, Register, Routes};
+use ya_relay_stack::smoltcp::wire;
 use ya_relay_stack::{Protocol, SocketDesc};
+
+const NAME: &str = env!("CARGO_PKG_NAME");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const RUST_LOG_VAR: &str = "RUST_LOG";
+
+const IP4_PROXY_ADDRESS: Ipv4Addr = Ipv4Addr::new(9, 0, 0x0d, 0x01);
+const IP6_PROXY_ADDRESS: Ipv6Addr = IP4_PROXY_ADDRESS.to_ipv6_mapped();
+const IP4_SERVICE_ADDRESS: Ipv4Addr = Ipv4Addr::new(9, 0, 0x0d, 0x02);
+const IP6_SERVICE_ADDRESS: Ipv6Addr = IP4_SERVICE_ADDRESS.to_ipv6_mapped();
+const SERVICE_PORT: u16 = 1;
 
 const READER_BUFFER_SIZE: usize = 2048;
 
@@ -25,124 +33,6 @@ struct Args {
     /// Socket to listen on
     #[clap(short, long, value_parser, default_value = "0.0.0.0:12345")]
     listen: SocketAddr,
-    /// TAP interface path
-    #[clap(long, value_parser, default_value = "proxy")]
-    tap: String,
-    /// TAP address
-    #[clap(long, value_parser, default_value = "10.0.0.1")]
-    tap_addr: Ipv4Addr,
-    /// TAP service address to connect to
-    #[clap(long, value_parser, default_value = "10.0.0.2:12345")]
-    tap_service: SocketAddr,
-}
-
-struct Network {
-    vnet: VirtualNetwork,
-    ready_tx: Option<oneshot::Sender<Addr<Self>>>,
-}
-
-impl Network {
-    pub fn spawn(ready_tx: oneshot::Sender<Addr<Self>>) -> (Self, EssentialChannels) {
-        let (vnet, essentials) = VirtualNetwork::spawn();
-        let ready_tx = Some(ready_tx);
-        let this = Self { vnet, ready_tx };
-        (this, essentials)
-    }
-}
-
-impl Actor for Network {
-    type Context = Context<Self>;
-
-    fn started(&mut self, ctx: &mut Self::Context) {
-        if let Some(tx) = self.ready_tx.take() {
-            if tx.send(ctx.address()).is_err() {
-                panic!("Unable to initialize network");
-            }
-        }
-    }
-}
-
-impl Handler<Register> for Network {
-    type Result = ActorResponse<Self, (Result<ConnectionChannels>, bool)>;
-
-    fn handle(&mut self, msg: Register, _ctx: &mut Self::Context) -> Self::Result {
-        let fut = match self.vnet.resolve_channel(msg.desc) {
-            Either::Left(fut) => async move { (fut.await, true) }.into_actor(self),
-            Either::Right(result) => return ActorResponse::reply((result, false)),
-        };
-        ActorResponse::r#async(fut)
-    }
-}
-
-impl Handler<Unregister> for Network {
-    type Result = <Unregister as Message>::Result;
-
-    fn handle(&mut self, msg: Unregister, _ctx: &mut Self::Context) -> Self::Result {
-        self.vnet.close_channel(msg.desc)
-    }
-}
-
-impl Handler<Connect> for Network {
-    type Result = ActorResponse<Self, Result<()>>;
-
-    fn handle(&mut self, msg: Connect, _ctx: &mut Self::Context) -> Self::Result {
-        let net = self.vnet.clone();
-        let fut = net.connect(msg.desc).into_actor(self);
-        ActorResponse::r#async(fut)
-    }
-}
-
-#[derive(Message)]
-#[rtype(result = "(Result<ConnectionChannels>, bool)")]
-struct Register {
-    desc: SocketDesc,
-}
-
-#[derive(Message)]
-#[rtype(result = "Result<()>")]
-struct Unregister {
-    desc: SocketDesc,
-}
-
-#[derive(Message)]
-#[rtype(result = "Result<()>")]
-struct Connect {
-    desc: SocketDesc,
-}
-
-#[derive(Clone, Default)]
-pub struct Routes {
-    state: Arc<RwLock<RouteState>>,
-}
-
-impl Routes {
-    #[inline]
-    pub async fn get(&self, listen: SocketAddr) -> Option<SocketAddr> {
-        let state = self.state.read().await;
-        state.routes.get(&listen).copied()
-    }
-
-    #[inline]
-    pub async fn add(&self, listen: SocketAddr, to: SocketAddr) {
-        let mut state = self.state.write().await;
-        state.routes.insert(listen, to);
-    }
-
-    #[inline]
-    pub async fn remove(&self, listen: SocketAddr) -> Option<SocketAddr> {
-        let mut state = self.state.write().await;
-        state.routes.remove(&listen)
-    }
-}
-
-#[derive(Default)]
-struct RouteState {
-    // when routes are dynamic
-    #[allow(unused)]
-    routes: HashMap<SocketAddr, SocketAddr>,
-    // for UDP
-    #[allow(unused)]
-    channels: HashMap<SocketDesc, ConnectionChannels>,
 }
 
 struct ForwardContext {
@@ -152,7 +42,7 @@ struct ForwardContext {
     desc: SocketDesc,
 }
 
-async fn tcp_acceptor(
+pub async fn tcp_acceptor(
     net: Addr<Network>,
     routes: Routes,
     local: SocketAddr,
@@ -160,11 +50,21 @@ async fn tcp_acceptor(
 ) {
     // TODO: use routes for dynamic dispatching
     loop {
-        let (stream, remote) = match listener.accept().await {
-            Ok((stream, remote)) => (stream, remote),
+        let (stream, from) = match listener.accept().await {
+            Ok((stream, from)) => (stream, from),
             Err(err) => {
                 log::error!("Local socket {local} error: {err}");
                 break;
+            }
+        };
+
+        log::debug!("Accepted TCP connection from {from}");
+
+        let remote = match routes.get(local).await {
+            Some(addr) => addr,
+            None => {
+                log::error!("Forward destination not found for {local}");
+                continue;
             }
         };
 
@@ -183,23 +83,22 @@ async fn tcp_acceptor(
 }
 
 async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream) {
-    log::info!("New connection: {:?}", ctx.desc);
-
     let _ = async move {
-        // we're overwriting existing connections in case of TCP
+        // overwrite existing entries for TCP
         let (channels, _) = v_register(ctx.net.clone(), ctx.desc).await?;
         v_connect(ctx.net, ctx.desc).await?;
 
-        let i_rx = channels
+        let tx = channels.send.sender();
+        let rx = channels
             .ingress
             .receiver()
-            .ok_or_else(|| Error::Manager("Ingress TCP channel already taken".to_string()))?;
-        let s_tx = channels.send.sender();
+            .ok_or_else(|| Error::Network("Ingress TCP channel already taken".to_string()))?
+            .boxed_local();
 
         let (reader, writer) = tokio::io::split(stream);
 
-        tokio::task::spawn_local(forward_tcp_to_vnet(ctx.desc, reader, s_tx));
-        tokio::task::spawn_local(forward_vnet_to_tcp(ctx.desc, i_rx, writer));
+        tokio::task::spawn_local(aux_reader_to_sink(reader, tx));
+        tokio::task::spawn_local(aux_stream_to_writer(rx, writer));
 
         Ok::<_, Error>(())
     }
@@ -207,27 +106,7 @@ async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream) {
     .await;
 }
 
-// Forwards data from a locally bound socket to a sink
-async fn forward_tcp_to_vnet(
-    desc: SocketDesc,
-    reader: ReadHalf<TcpStream>,
-    tx: mpsc::Sender<Vec<u8>>,
-) {
-    aux_reader_to_sink(reader, tx).await;
-    log::info!("Socket to virtual network channel stopped for {desc:?}");
-}
-
-// Forwards stream to a locally bound socket
-async fn forward_vnet_to_tcp(
-    desc: SocketDesc,
-    rx: mpsc::Receiver<Vec<u8>>,
-    writer: WriteHalf<TcpStream>,
-) {
-    aux_stream_to_writer(rx, writer).await;
-    log::info!("Virtual network to socket channel stopped for {desc:?}");
-}
-
-async fn aux_reader_to_sink<S, E, T>(mut reader: ReadHalf<T>, mut tx: S)
+pub async fn aux_reader_to_sink<S, E, T>(mut reader: ReadHalf<T>, mut tx: S)
 where
     S: Sink<Vec<u8>, Error = E> + Unpin,
     T: AsyncRead,
@@ -256,7 +135,6 @@ where
 {
     while let Some(vec) = rx.next().await {
         let mut idx = 0 as usize;
-
         loop {
             match writer.write(&vec[idx..]).await {
                 Ok(0) => break,
@@ -266,7 +144,6 @@ where
                     break;
                 }
             }
-
             if idx >= vec.len() {
                 break;
             }
@@ -274,81 +151,158 @@ where
     }
 }
 
+async fn aux_forward<St, Si, E>(mut rx: St, mut tx: Si)
+where
+    St: Stream<Item = Vec<u8>> + Unpin,
+    Si: Sink<Vec<u8>, Error = E> + Unpin,
+{
+    while let Some(data) = rx.next().await {
+        if tx.send(data).await.is_err() {
+            break;
+        }
+    }
+}
+
+// helper: creates TCP connection communication channels via `Network` actor
+// this is done BEFORE connecting so that we can exchange any prior traffic
+// (e.g. ARP requests / responses)
 async fn v_register(net: Addr<Network>, desc: SocketDesc) -> Result<(ConnectionChannels, bool)> {
     match net.send(Register { desc }).await {
         Ok((Ok(channels), pending)) => Ok((channels, pending)),
-        Ok((Err(e), _)) => Err(Error::Manager(format!(
+        Ok((Err(e), _)) => Err(Error::Network(format!(
             "Error adding connection {desc:?}: {e}"
         ))),
-        Err(_) => Err(Error::Manager(format!(
+        Err(_) => Err(Error::Network(format!(
             "Cannot add connection {desc:?}: virtual network not started"
         ))),
     }
 }
 
+// helper: establishes a TCP connection using the `Network` actor
 async fn v_connect(net: Addr<Network>, desc: SocketDesc) -> Result<()> {
     match net.send(Connect { desc }).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(Error::Manager(format!("Error connecting to {desc:?}: {e}"))),
-        Err(_) => Err(Error::Manager(format!(
+        Ok(Err(e)) => Err(Error::Network(format!("Error connecting to {desc:?}: {e}"))),
+        Err(_) => Err(Error::Network(format!(
             "Cannot connect to {desc:?}: virtual network not started"
         ))),
     }
 }
 
-fn create_tap(name: &str, address: Ipv4Addr) -> anyhow::Result<Tun> {
-    Ok(TunBuilder::new()
-        .name(name)
-        .tap(true)
-        .packet_info(false)
-        .mtu(1500)
-        .up()
-        .address(address)
-        .broadcast(Ipv4Addr::BROADCAST)
-        .netmask(Ipv4Addr::new(255, 255, 255, 0))
-        .try_build()
-        .map_err(|e| anyhow::anyhow!("Failed to create a TAP interface: {}", e))?)
+// the service - logs received bytes as strings
+async fn service_thread<S>(mut rx: S)
+where
+    S: Stream<Item = Vec<u8>> + Unpin,
+{
+    while let Some(data) = rx.next().await {
+        log::info!(
+            "[service]: {}",
+            String::from_utf8_lossy(&data[..]).replace("\n", "")
+        );
+    }
+    log::info!("[service] stopped");
 }
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
-    // FIXME: consider logging to a file
+    const DEFAULT_LOG: &str = "trace,mio=info,smoltcp=info,ya_relay_stack=info";
+
+    std::env::set_var(
+        RUST_LOG_VAR,
+        std::env::var(RUST_LOG_VAR).unwrap_or_else(|_| DEFAULT_LOG.to_string()),
+    );
     env_logger::init();
+
     let args: Args = Args::parse();
 
-    log::info!("Creating TAP interface {}", args.tap);
-    let iface = create_tap(&args.tap, args.tap_addr)?;
+    log::info!("Starting {NAME} v{VERSION}");
+    let routes = Routes::default();
+    let remote = SocketAddr::new(IP4_SERVICE_ADDRESS.into(), SERVICE_PORT);
+    routes.add(args.listen, remote).await;
 
-    log::info!("Starting virtual network");
+    // service to proxy channel
+    let s_to_p = Channel::default();
+    // proxy to service channel
+    let p_to_s = Channel::default();
+
+    log::info!("[service] initializing smoltcp stack");
+    let conf = VirtualNetworkConfig {
+        mtu: 1500,
+        hw_addr: wire::HardwareAddress::Ethernet(wire::EthernetAddress([
+            0xb0, 0x01, 0x01, 0x01, 0x01, 0x01,
+        ])),
+        ip4_addr: IP4_SERVICE_ADDRESS,
+        ip6_addr: IP6_SERVICE_ADDRESS,
+        capture_ingress: true,
+    };
+
+    // receive outgoing packets from proxy
+    let p_s_rx = p_to_s.receiver().unwrap();
+    // send outgoing packets to proxy
+    let s_p_tx = s_to_p.sender();
+
     let (tx_addr, rx_addr) = oneshot::channel();
-
     std::thread::spawn(move || {
         let system = System::new();
         system.block_on(async move {
-            let (net, essentials) = Network::spawn(tx_addr);
-            let (reader, writer) = tokio::io::split(iface);
+            let (net, channels) = Network::spawn(conf, tx_addr);
+            net.bind(Protocol::Tcp, IP4_SERVICE_ADDRESS.into(), SERVICE_PORT)
+                .expect("[service] failed to bind socket");
 
-            tokio::task::spawn_local(aux_reader_to_sink(reader, essentials.receive));
-            tokio::task::spawn_local(aux_stream_to_writer(essentials.egress, writer));
+            // receive outgoing packets from proxy
+            tokio::task::spawn_local(aux_forward(p_s_rx, channels.receive));
+            // send outgoing packets to proxy
+            tokio::task::spawn_local(aux_forward(channels.egress, s_p_tx));
+            // service consumes incoming socket payload and logs it as strings
+            tokio::task::spawn_local(service_thread(channels.ingress.unwrap()));
+
+            log::info!("[service] running");
 
             net.start();
 
-            // TODO: abortable
             let _ = tokio::signal::ctrl_c().await;
         });
     });
+    let _ = tokio::time::timeout(Duration::from_millis(2000), rx_addr).await??;
 
+    log::info!("[proxy] initializing smoltcp stack");
+    let conf = VirtualNetworkConfig {
+        mtu: 1500,
+        hw_addr: wire::HardwareAddress::Ethernet(wire::EthernetAddress([
+            0xb0, 0x02, 0x02, 0x02, 0x02, 0x02,
+        ])),
+        ip4_addr: IP4_PROXY_ADDRESS,
+        ip6_addr: IP6_PROXY_ADDRESS,
+        capture_ingress: false,
+    };
+
+    // receive outgoing packets from service
+    let s_p_rx = s_to_p.receiver().unwrap();
+    // send outgoing packets to service
+    let p_s_tx = p_to_s.sender();
+
+    let (tx_addr, rx_addr) = oneshot::channel();
+    std::thread::spawn(move || {
+        let system = System::new();
+        system.block_on(async move {
+            let (net, channels) = Network::spawn(conf, tx_addr);
+
+            // receive outgoing packets from service
+            tokio::task::spawn_local(aux_forward(s_p_rx, channels.receive));
+            // send outgoing packets to service
+            tokio::task::spawn_local(aux_forward(channels.egress, p_s_tx));
+
+            net.start();
+
+            let _ = tokio::signal::ctrl_c().await;
+        });
+    });
     let net = tokio::time::timeout(Duration::from_millis(2000), rx_addr).await??;
-
-    log::info!("Starting server on {}", args.listen);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
 
-    let routes = Routes::default();
-    routes.add(args.listen, args.tap_service).await;
-
+    log::info!("[proxy] listening on {}", args.listen);
     tokio::task::spawn_local(tcp_acceptor(net, routes, args.listen, listener));
 
-    // TODO: spawn an HTTP server
     tokio::signal::ctrl_c().await?;
     Ok(())
 }
