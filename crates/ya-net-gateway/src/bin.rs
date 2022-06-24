@@ -48,7 +48,6 @@ pub async fn tcp_acceptor(
     local: SocketAddr,
     listener: tokio::net::TcpListener,
 ) {
-    // TODO: use routes for dynamic dispatching
     loop {
         let (stream, from) = match listener.accept().await {
             Ok((stream, from)) => (stream, from),
@@ -92,8 +91,7 @@ async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream) {
         let rx = channels
             .ingress
             .receiver()
-            .ok_or_else(|| Error::Network("Ingress TCP channel already taken".to_string()))?
-            .boxed_local();
+            .ok_or_else(|| Error::Network("Ingress TCP channel already taken".to_string()))?;
 
         let (reader, writer) = tokio::io::split(stream);
 
@@ -216,8 +214,8 @@ async fn main() -> anyhow::Result<()> {
     let args: Args = Args::parse();
 
     log::info!("Starting {NAME} v{VERSION}");
-    let routes = Routes::default();
     let remote = SocketAddr::new(IP4_SERVICE_ADDRESS.into(), SERVICE_PORT);
+    let routes = Routes::default();
     routes.add(args.listen, remote).await;
 
     // service to proxy channel
