@@ -10,8 +10,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 use tokio::net::TcpStream;
 
 use ya_net_gateway::error::{Error, Result};
-use ya_net_gateway::net::virt::{Channel, ConnectionChannels, VirtualNetworkConfig};
-use ya_net_gateway::net::{Connect, Network, Register, Routes};
+use ya_net_gateway::network::virt::{Channel, ConnectionChannels, VirtualNetworkConfig};
+use ya_net_gateway::network::{Connect, Network, Register, Routes};
 use ya_relay_stack::smoltcp::wire;
 use ya_relay_stack::{Protocol, SocketDesc};
 
@@ -50,7 +50,7 @@ pub async fn tcp_acceptor(
 ) {
     loop {
         let (stream, from) = match listener.accept().await {
-            Ok((stream, from)) => (stream, from),
+            Ok(tuple) => tuple,
             Err(err) => {
                 log::error!("Local socket {local} error: {err}");
                 break;
@@ -84,8 +84,8 @@ pub async fn tcp_acceptor(
 async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream) {
     let _ = async move {
         // overwrite existing entries for TCP
-        let (channels, _) = v_register(ctx.net.clone(), ctx.desc).await?;
-        v_connect(ctx.net, ctx.desc).await?;
+        let (channels, _) = net_register(ctx.net.clone(), ctx.desc).await?;
+        net_connect(ctx.net, ctx.desc).await?;
 
         let tx = channels.send.sender();
         let rx = channels
@@ -164,7 +164,7 @@ where
 // helper: creates TCP connection communication channels via `Network` actor
 // this is done BEFORE connecting so that we can exchange any prior traffic
 // (e.g. ARP requests / responses)
-async fn v_register(net: Addr<Network>, desc: SocketDesc) -> Result<(ConnectionChannels, bool)> {
+async fn net_register(net: Addr<Network>, desc: SocketDesc) -> Result<(ConnectionChannels, bool)> {
     match net.send(Register { desc }).await {
         Ok((Ok(channels), pending)) => Ok((channels, pending)),
         Ok((Err(e), _)) => Err(Error::Network(format!(
@@ -177,7 +177,7 @@ async fn v_register(net: Addr<Network>, desc: SocketDesc) -> Result<(ConnectionC
 }
 
 // helper: establishes a TCP connection using the `Network` actor
-async fn v_connect(net: Addr<Network>, desc: SocketDesc) -> Result<()> {
+async fn net_connect(net: Addr<Network>, desc: SocketDesc) -> Result<()> {
     match net.send(Connect { desc }).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(Error::Network(format!("Error connecting to {desc:?}: {e}"))),
@@ -204,6 +204,7 @@ where
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
     const DEFAULT_LOG: &str = "trace,mio=info,smoltcp=info,ya_relay_stack=info";
+    const NET_SPAWN_TIMEOUT: Duration = Duration::from_millis(2000);
 
     std::env::set_var(
         RUST_LOG_VAR,
@@ -243,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
     std::thread::spawn(move || {
         let system = System::new();
         system.block_on(async move {
-            let (net, channels) = Network::spawn(conf, tx_addr);
+            let (net, channels) = Network::spawn(conf);
             net.bind(Protocol::Tcp, IP4_SERVICE_ADDRESS.into(), SERVICE_PORT)
                 .expect("[service] failed to bind socket");
 
@@ -256,12 +257,12 @@ async fn main() -> anyhow::Result<()> {
 
             log::info!("[service] running");
 
-            net.start();
-
+            let addr = net.start();
+            let _ = tx_addr.send(addr);
             let _ = tokio::signal::ctrl_c().await;
         });
     });
-    let _ = tokio::time::timeout(Duration::from_millis(2000), rx_addr).await??;
+    let _ = tokio::time::timeout(NET_SPAWN_TIMEOUT, rx_addr).await??;
 
     log::info!("[proxy] initializing smoltcp stack");
     let conf = VirtualNetworkConfig {
@@ -283,19 +284,19 @@ async fn main() -> anyhow::Result<()> {
     std::thread::spawn(move || {
         let system = System::new();
         system.block_on(async move {
-            let (net, channels) = Network::spawn(conf, tx_addr);
+            let (net, channels) = Network::spawn(conf);
 
             // receive outgoing packets from service
             tokio::task::spawn_local(aux_forward(s_p_rx, channels.receive));
             // send outgoing packets to service
             tokio::task::spawn_local(aux_forward(channels.egress, p_s_tx));
 
-            net.start();
-
+            let addr = net.start();
+            let _ = tx_addr.send(addr);
             let _ = tokio::signal::ctrl_c().await;
         });
     });
-    let net = tokio::time::timeout(Duration::from_millis(2000), rx_addr).await??;
+    let net = tokio::time::timeout(NET_SPAWN_TIMEOUT, rx_addr).await??;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
 
     log::info!("[proxy] listening on {}", args.listen);

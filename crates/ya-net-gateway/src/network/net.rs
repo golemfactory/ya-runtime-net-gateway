@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use actix::{Actor, ActorResponse, Addr, AsyncContext, Context, Handler, Message, WrapFuture};
-use futures::channel::oneshot;
+use actix::{Actor, ActorResponse, Context, Handler, Message, WrapFuture};
 use futures::future::Either;
 use tokio::sync::RwLock;
 
@@ -16,23 +15,14 @@ use crate::network::virt::{
 
 pub struct Network {
     vnet: VirtualNetwork,
-    ready_tx: Option<oneshot::Sender<Addr<Self>>>,
 }
 
 impl Network {
-    pub fn spawn(
-        conf: VirtualNetworkConfig,
-        ready_tx: oneshot::Sender<Addr<Self>>,
-    ) -> (Self, NetworkChannels) {
+    pub fn spawn(conf: VirtualNetworkConfig) -> (Self, NetworkChannels) {
         let (vnet, channels) = VirtualNetwork::spawn(conf);
-        let this = Self {
-            vnet,
-            ready_tx: Some(ready_tx),
-        };
-        (this, channels)
+        (Self { vnet }, channels)
     }
 
-    // FIXME: remove - required for this example only
     pub fn bind(&self, protocol: Protocol, addr: IpAddr, port: u16) -> Result<()> {
         self.vnet.bind(protocol, addr, port)
     }
@@ -40,14 +30,6 @@ impl Network {
 
 impl Actor for Network {
     type Context = Context<Self>;
-
-    fn started(&mut self, ctx: &mut Self::Context) {
-        if let Some(tx) = self.ready_tx.take() {
-            if tx.send(ctx.address()).is_err() {
-                panic!("Unable to initialize network");
-            }
-        }
-    }
 }
 
 impl Handler<Register> for Network {
@@ -125,10 +107,8 @@ impl Routes {
 
 #[derive(Default)]
 struct RouteState {
-    // when routes are dynamic
     #[allow(unused)]
     routes: HashMap<SocketAddr, SocketAddr>,
-    // for UDP
     #[allow(unused)]
     channels: HashMap<SocketDesc, ConnectionChannels>,
 }

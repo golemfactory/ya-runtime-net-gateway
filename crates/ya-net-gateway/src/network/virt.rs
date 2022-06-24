@@ -10,6 +10,7 @@ use futures::channel::mpsc;
 use futures::future::{Either, LocalBoxFuture, Shared};
 use futures::stream::BoxStream;
 use futures::{FutureExt, SinkExt, StreamExt};
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use ya_relay_stack::connection::ConnectionMeta;
@@ -18,8 +19,6 @@ use ya_relay_stack::smoltcp::wire::IpCidr;
 use ya_relay_stack::{IngressEvent, IngressReceiver, Network, Protocol, SocketDesc};
 
 use crate::error::{Error, Result};
-
-pub type MacAddr = [u8; 6];
 
 #[derive(Clone, Debug)]
 pub struct VirtualNetworkConfig {
@@ -38,7 +37,7 @@ pub struct VirtualNetwork {
 
 impl VirtualNetwork {
     pub fn spawn(conf: VirtualNetworkConfig) -> (Self, NetworkChannels) {
-        let capture_ingress = conf.capture_ingress;
+        let service = conf.capture_ingress;
         let net = create_network(conf);
         net.spawn_local();
 
@@ -47,8 +46,7 @@ impl VirtualNetwork {
         let egress_rx =
             StreamExt::boxed(UnboundedReceiverStream::new(egress_rx).map(|e| e.payload.into_vec()));
 
-        let conns = Default::default();
-        let this = Self { net, conns };
+        let this = Self::new(net);
 
         let (receive_tx, receive_rx) = mpsc::channel(1);
         let mut channels = NetworkChannels {
@@ -57,7 +55,7 @@ impl VirtualNetwork {
             receive: receive_tx,
         };
 
-        if capture_ingress {
+        if service {
             let stream = UnboundedReceiverStream::new(ingress_rx).filter_map(|e| async move {
                 if let IngressEvent::Packet { payload, .. } = e {
                     return Some(payload);
@@ -68,9 +66,15 @@ impl VirtualNetwork {
         } else {
             tokio::task::spawn_local(this.clone().handle_stack_ingress(ingress_rx));
         }
+
         tokio::task::spawn_local(this.clone().handle_stack_receive(receive_rx));
 
         (this, channels)
+    }
+
+    fn new(net: Network) -> Self {
+        let conns = Default::default();
+        Self { net, conns }
     }
 
     // channels are required for passing any traffic required for TCP (i.e. ARP)
@@ -94,8 +98,35 @@ impl VirtualNetwork {
         }
     }
 
-    pub fn close_channel(&self, _desc: SocketDesc) -> Result<()> {
-        todo!()
+    pub fn close_channel(&self, desc: SocketDesc) -> Result<()> {
+        match {
+            let mut conns = self.conns.borrow_mut();
+            conns.remove(&desc)
+        } {
+            Some(conn) => {
+                conn.channels().close();
+                Ok(())
+            }
+            None => Err(Error::Network("Channel not found".to_string())),
+        }
+    }
+
+    fn get_channel<F, T>(&self, desc: &SocketDesc, f: F) -> Option<T>
+    where
+        F: Fn(&ConnectionChannels) -> T,
+    {
+        let conns = self.conns.borrow();
+        match conns.get(desc) {
+            Some(conn) => {
+                let state = conn.state.borrow();
+                match &*state {
+                    ConnectionState::Established(_, channels) => return Some(f(channels)),
+                    _ => log::info!("Connection to {:?} is in invalid state", desc),
+                }
+            }
+            _ => log::error!("Unable to route ingress packet: no connection"),
+        }
+        None
     }
 
     fn create_channel(&self, desc: SocketDesc) -> Result<ConnectionChannels> {
@@ -111,7 +142,12 @@ impl VirtualNetwork {
         .boxed_local()
         .shared();
 
-        let pending = PendingConnection { ready_tx, ready };
+        let lock = Default::default();
+        let pending = PendingConnection {
+            ready_tx,
+            ready,
+            lock,
+        };
         let state_pending = ConnectionState::Pending(pending, channels.clone());
         let state = Rc::new(RefCell::new(state_pending));
 
@@ -130,47 +166,35 @@ impl VirtualNetwork {
     pub fn connect(&self, desc: SocketDesc) -> LocalBoxFuture<'static, Result<()>> {
         let this = self.clone();
         let conns = self.conns.clone();
-        let conn = {
-            let conns = conns.borrow();
-            conns.get(&desc).cloned()
-        };
+        let conn = { conns.borrow().get(&desc).cloned() };
 
         async move {
-            let mut conn = match conn {
-                Some(conn) => conn,
-                _ => {
-                    let msg = format!("Connection unexpectedly removed: {:?}", desc);
-                    return Err(Error::Network(msg));
-                }
+            let mut conn =
+                conn.ok_or_else(|| Error::Network(format!("Connection {:?} not found", desc)))?;
+
+            let lock = match conn.lock() {
+                Some(lock) => lock,
+                None => return Ok(()),
             };
 
-            let vconn = this.connect_stack(desc).await?;
-            conn.establish(vconn);
+            let _guard = lock.lock().await;
 
-            let state = conn.state.borrow().clone();
-            let (established, channels) = match state {
-                ConnectionState::Established(established, channels) => (established, channels),
-                _ => {
-                    let msg = format!("Connection not established: {:?}", desc);
-                    return Err(Error::Network(msg));
-                }
-            };
-
-            tokio::task::spawn_local(this.clone().handle_conn_send(established, channels.clone()));
-
-            if let Some(mut tx) = conn.ready_tx() {
-                let _ = tx.send(Ok(channels)).await;
+            if conn.is_established() {
+                return Ok(());
             }
+
+            let stack_conn = this.stack_connect(desc).await?;
+            let (estd, cc) = conn.establish(stack_conn);
+
+            tokio::task::spawn_local(this.clone().handle_conn_send(estd, cc.clone()));
+            let _ = conn.ready_tx().send(Ok(cc)).await;
 
             Ok(())
         }
         .then(move |result| async move {
             if let Err(ref e) = result {
-                let conn = {
-                    let mut conns_ = conns.borrow_mut();
-                    conns_.remove(&desc)
-                };
-                if let Some(Some(mut tx)) = conn.map(|c| c.ready_tx()) {
+                let conn = { conns.borrow_mut().remove(&desc) };
+                if let Some(mut tx) = conn.map(|c| c.ready_tx()) {
                     let err = Error::Network(format!("Connection failed: {e}"));
                     let _ = tx.send(Err(err)).await;
                 }
@@ -180,7 +204,7 @@ impl VirtualNetwork {
         .boxed_local()
     }
 
-    async fn connect_stack(&self, desc: SocketDesc) -> Result<ya_relay_stack::Connection> {
+    async fn stack_connect(&self, desc: SocketDesc) -> Result<ya_relay_stack::Connection> {
         let conn = if desc.protocol == Protocol::Tcp {
             self.net
                 .connect(desc.remote.ip_endpoint()?, Duration::from_millis(2000))
@@ -197,35 +221,15 @@ impl VirtualNetwork {
         Ok(conn)
     }
 
-    fn get_connection<F, T>(&self, desc: &SocketDesc, f: F) -> Option<T>
-    where
-        F: Fn(&ConnectionChannels) -> T,
-    {
-        let conns = self.conns.borrow();
-        match conns.get(desc) {
-            Some(conn) => {
-                let state = conn.state.borrow();
-                match &*state {
-                    ConnectionState::Established(_, channels) => return Some(f(channels)),
-                    _ => log::info!("Connection to {:?} is in invalid state", desc),
-                }
-            }
-            _ => log::error!("Unable to route ingress packet: no connection"),
-        }
-        None
-    }
-
     // handle ingress packets emitted from the stack
     async fn handle_stack_ingress(self, mut rx: IngressReceiver) {
         while let Some(evt) = rx.recv().await {
             let (desc, payload) = match evt {
                 IngressEvent::InboundConnection { desc } => {
-                    // TODO: handle
                     log::info!("Ingress: connection from {:?}", desc);
                     continue;
                 }
                 IngressEvent::Disconnected { desc } => {
-                    // TODO: handle
                     log::info!("Ingress: disconnected from {:?}", desc);
                     continue;
                 }
@@ -234,7 +238,7 @@ impl VirtualNetwork {
 
             log::info!("Ingress: packet from {:?}: {:?}", desc, payload);
 
-            if let Some(mut tx) = self.get_connection(&desc, |c| c.ingress.tx.clone()) {
+            if let Some(mut tx) = self.get_channel(&desc, |c| c.ingress.tx.clone()) {
                 if let Err(e) = tx.send(payload).await {
                     log::error!("Ingress: unable to route packet: {e}");
                 }
@@ -253,29 +257,25 @@ impl VirtualNetwork {
     }
 
     // handle payload to be sent via a virtual socket;
-    // most probably will generate an egress event
-    async fn handle_conn_send(
-        self,
-        established: EstablishedConnection,
-        channels: ConnectionChannels,
-    ) {
+    // may generate an egress event
+    async fn handle_conn_send(self, estd: EstablishedConnection, channels: ConnectionChannels) {
         let mut rx = channels.send.receiver().unwrap();
 
         while let Some(data) = rx.next().await {
-            match self.net.send(data, established.vconn) {
+            match self.net.send(data, estd.stack_conn) {
                 Ok(send) => {
                     if let Err(e) = send.await {
-                        log::warn!("Send via {:?} failed: {e}", established.vconn.meta);
+                        log::warn!("Send via {:?} failed: {e}", estd.stack_conn.meta);
                         break;
                     }
                 }
                 Err(e) => {
-                    log::warn!("Send via {:?} failed: {e}", established.vconn.meta);
+                    log::warn!("Send via {:?} failed: {e}", estd.stack_conn.meta);
                     break;
                 }
             }
+            self.net.poll();
         }
-        self.net.poll();
     }
 }
 
@@ -296,6 +296,13 @@ pub struct ConnectionChannels {
     pub ingress: Channel<Vec<u8>>,
 }
 
+impl ConnectionChannels {
+    pub fn close(self) {
+        self.send.close();
+        self.ingress.close();
+    }
+}
+
 #[derive(Clone)]
 pub struct Channel<T> {
     tx: mpsc::Sender<T>,
@@ -311,6 +318,10 @@ impl<T> Channel<T> {
         let mut rx = self.rx.write().unwrap();
         rx.take()
     }
+
+    pub fn close(mut self) {
+        self.tx.close_channel();
+    }
 }
 
 impl<T> Default for Channel<T> {
@@ -322,12 +333,12 @@ impl<T> Default for Channel<T> {
 }
 
 #[derive(Clone)]
-pub struct Connection {
+struct Connection {
     pub state: Rc<RefCell<ConnectionState>>,
 }
 
 impl Connection {
-    pub fn channels(&self) -> ConnectionChannels {
+    fn channels(&self) -> ConnectionChannels {
         let state = self.state.borrow();
         match &*state {
             ConnectionState::Pending(_, channels) | ConnectionState::Established(_, channels) => {
@@ -337,41 +348,71 @@ impl Connection {
         }
     }
 
-    pub fn ready_tx(&self) -> Option<mpsc::Sender<Result<ConnectionChannels>>> {
+    fn lock(&self) -> Option<Arc<Mutex<()>>> {
         let state = self.state.borrow();
         match &*state {
-            ConnectionState::Pending(pending, _) => Some(pending.ready_tx.clone()),
+            ConnectionState::Pending(pending, _) => Some(pending.lock.clone()),
             _ => None,
         }
     }
 
-    pub fn establish(&mut self, vconn: ya_relay_stack::Connection) {
+    fn ready_tx(&self) -> mpsc::Sender<Result<ConnectionChannels>> {
+        let state = self.state.borrow();
+        match &*state {
+            ConnectionState::Pending(pending, _) => pending.ready_tx.clone(),
+            ConnectionState::Established(estd, _) => estd.ready_tx.clone(),
+            _ => panic!("Programming error: poisoned connection"),
+        }
+    }
+
+    fn is_established(&self) -> bool {
+        let state = self.state.borrow();
+        matches!(&*state, ConnectionState::Established(_, _))
+    }
+
+    fn establish(
+        &mut self,
+        stack_conn: ya_relay_stack::Connection,
+    ) -> (EstablishedConnection, ConnectionChannels) {
         let mut state = self.state.borrow_mut();
-        *state = match std::mem::replace(&mut *state, ConnectionState::Poisoned) {
-            ConnectionState::Pending(_, channels) => {
-                ConnectionState::Established(EstablishedConnection { vconn }, channels)
+        let (estd, channels) = match std::mem::replace(&mut *state, ConnectionState::Poisoned) {
+            ConnectionState::Pending(pending, channels) => {
+                let estd = EstablishedConnection {
+                    ready_tx: pending.ready_tx,
+                    stack_conn,
+                };
+                (estd, channels)
             }
-            s => s,
+            ConnectionState::Established(mut estd, channels) => {
+                estd.stack_conn = stack_conn;
+                (estd, channels)
+            }
+            ConnectionState::Poisoned => panic!("Programming error: poisoned connection"),
         };
+        *state = ConnectionState::Established(estd.clone(), channels.clone());
+
+        (estd, channels)
     }
 }
 
 #[derive(Clone)]
-pub enum ConnectionState {
+enum ConnectionState {
     Pending(PendingConnection, ConnectionChannels),
     Established(EstablishedConnection, ConnectionChannels),
     Poisoned,
 }
 
 #[derive(Clone)]
-pub struct PendingConnection {
+struct PendingConnection {
     ready_tx: mpsc::Sender<Result<ConnectionChannels>>,
     ready: Shared<LocalBoxFuture<'static, Result<ConnectionChannels>>>,
+    lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
-pub struct EstablishedConnection {
-    pub vconn: ya_relay_stack::Connection,
+struct EstablishedConnection {
+    ready_tx: mpsc::Sender<Result<ConnectionChannels>>,
+    stack_conn: ya_relay_stack::Connection,
 }
 
 fn create_network(conf: VirtualNetworkConfig) -> Network {
