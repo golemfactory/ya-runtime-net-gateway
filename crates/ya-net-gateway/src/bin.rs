@@ -1,11 +1,15 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use actix::{Actor, Addr};
 use actix_rt::System;
+use actix_web;
+use actix_web::{web, get, post, delete};
 use clap::Parser;
 use futures::channel::oneshot;
 use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt};
+use serde;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
@@ -30,9 +34,6 @@ const READER_BUFFER_SIZE: usize = 2048;
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Socket to listen on
-    #[clap(short, long, value_parser, default_value = "0.0.0.0:12345")]
-    listen: SocketAddr,
 }
 
 struct ForwardContext {
@@ -201,9 +202,89 @@ where
     log::info!("[service] stopped");
 }
 
+
+/*
+ * control API
+ */
+
+struct WebData {
+    prev_id: u32,
+    routes_tcp: Routes,
+    net: Addr<Network>,
+}
+
+#[derive(serde::Deserialize)]
+struct TcpConnectRequest {
+    // XXX this probably needs only port! allowing IP address could be an oracle if the real IP
+    // address (internal, after NAT) needs to remain confidential
+	listen: String,
+
+    // XXX rename to "forward"?
+    remote: String,
+}
+
+#[derive(serde::Serialize)]
+struct TcpConnectResponse {
+    id: u32,
+}
+
+#[post("/tcp")]
+async fn tcp_post(data: web::Data<Mutex<WebData>>, req: web::Json<TcpConnectRequest>) -> actix_web::Result<actix_web::HttpResponse> {
+    let mut data = data.lock().unwrap();
+    data.prev_id += 1;
+
+    let listen: SocketAddr;
+    match req.listen.parse() {
+        Ok(l) => listen = l,
+        Err(e) => return Ok(actix_web::HttpResponse::BadRequest().body(format!("listen: {e}"))),
+    };
+
+    let remote: SocketAddr;
+    match req.remote.parse() {
+        Ok(r) => remote = r,
+        Err(e) => return Ok(actix_web::HttpResponse::BadRequest().body(format!("remote: {e}"))),
+    };
+
+    log::debug!("listen: {listen:?} remote: {remote:?}");
+
+    // XXX this badly needs error handling in case `listen` is duplicated
+    data.routes_tcp.add(listen, remote).await;
+
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+
+    log::info!("[proxy] listening on {}", listen);
+    tokio::task::spawn_local(tcp_acceptor(data.net.clone(), data.routes_tcp.clone(), listen, listener));
+
+    Ok(actix_web::HttpResponse::Ok().json(TcpConnectResponse { id: data.prev_id }))
+}
+
+#[derive(serde::Serialize)]
+struct TcpDisconnectResponse {
+    // TODO
+}
+
+#[delete("/tcp/{id}")]
+async fn tcp_delete(data: web::Data<Mutex<WebData>>, path: web::Path<(u32,)>) -> actix_web::Result<actix_web::HttpResponse> {
+    let data = data.lock().unwrap();
+    let (id,) = path.into_inner();
+
+    log::debug!("close: {:?}", id);
+
+    Ok(actix_web::HttpResponse::Ok().json(TcpDisconnectResponse {}))
+}
+
+#[get("/metrics")]
+async fn metrics(data: web::Data<Mutex<WebData>>) -> String {
+    format!("\
+        TODO_metrics{{iface=\"1\"}} {}\n\
+        TODO_metrics{{iface=\"2\"}} {}\n\
+    ", 1, 2)
+}
+
+
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
-    const DEFAULT_LOG: &str = "trace,mio=info,smoltcp=info,ya_relay_stack=info";
+    const DEFAULT_LOG: &str = "trace,mio=info,smoltcp=info,ya_relay_stack=info,actix_http=info";
     const NET_SPAWN_TIMEOUT: Duration = Duration::from_millis(2000);
 
     std::env::set_var(
@@ -212,12 +293,9 @@ async fn main() -> anyhow::Result<()> {
     );
     env_logger::init();
 
-    let args: Args = Args::parse();
+    let _args: Args = Args::parse();
 
     log::info!("Starting {NAME} v{VERSION}");
-    let remote = SocketAddr::new(IP4_SERVICE_ADDRESS.into(), SERVICE_PORT);
-    let routes = Routes::default();
-    routes.add(args.listen, remote).await;
 
     // service to proxy channel
     let s_to_p = Channel::default();
@@ -296,12 +374,23 @@ async fn main() -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         });
     });
-    let net = tokio::time::timeout(NET_SPAWN_TIMEOUT, rx_addr).await??;
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
 
-    log::info!("[proxy] listening on {}", args.listen);
-    tokio::task::spawn_local(tcp_acceptor(net, routes, args.listen, listener));
+    let data = web::Data::new(Mutex::new(WebData {
+		prev_id: 0,
+        routes_tcp: Routes::default(),
+        net: tokio::time::timeout(NET_SPAWN_TIMEOUT, rx_addr).await??,
+    }));
 
-    tokio::signal::ctrl_c().await?;
+    actix_web::HttpServer::new(move || {
+        actix_web::App::new()
+            .app_data(data.clone())
+            .service(tcp_post)
+            .service(tcp_delete)
+            .service(metrics)
+    })
+    .bind(("127.0.0.1", 8000)).expect("failet do bind()")
+    .run()
+    .await.expect("await failed");
+
     Ok(())
 }
