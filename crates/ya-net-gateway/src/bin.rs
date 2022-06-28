@@ -5,13 +5,13 @@ use actix::{Actor, Addr};
 use actix_rt::System;
 use clap::Parser;
 use futures::channel::oneshot;
-use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt};
+use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryFutureExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 use ya_net_gateway::error::{Error, Result};
 use ya_net_gateway::network::virt::{Channel, ConnectionChannels, VirtualNetworkConfig};
-use ya_net_gateway::network::{Connect, Network, Register, Routes};
+use ya_net_gateway::network::{Connect, Network, Register, Routes, Unregister};
 use ya_relay_stack::smoltcp::wire;
 use ya_relay_stack::{Protocol, SocketDesc};
 
@@ -52,17 +52,17 @@ pub async fn tcp_acceptor(
         let (stream, from) = match listener.accept().await {
             Ok(tuple) => tuple,
             Err(err) => {
-                log::error!("Local socket {local} error: {err}");
+                log::error!("[proxy] local socket {local} error: {err}");
                 break;
             }
         };
 
-        log::debug!("Accepted TCP connection from {from}");
+        log::debug!("[proxy] accepted TCP connection from {from}");
 
         let remote = match routes.get(local).await {
             Some(addr) => addr,
             None => {
-                log::error!("Forward destination not found for {local}");
+                log::error!("[proxy] forward destination not found for {local}");
                 continue;
             }
         };
@@ -72,7 +72,7 @@ pub async fn tcp_acceptor(
             routes: routes.clone(),
             desc: SocketDesc {
                 protocol: Protocol::Tcp,
-                local: local.into(),
+                local: from.into(),
                 remote: remote.into(),
             },
         };
@@ -85,7 +85,7 @@ async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream) {
     let _ = async move {
         // overwrite existing entries for TCP
         let (channels, _) = net_register(ctx.net.clone(), ctx.desc).await?;
-        net_connect(ctx.net, ctx.desc).await?;
+        net_connect(ctx.net.clone(), ctx.desc).await?;
 
         let tx = channels.send.sender();
         let rx = channels
@@ -95,7 +95,11 @@ async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream) {
 
         let (reader, writer) = tokio::io::split(stream);
 
-        tokio::task::spawn_local(aux_reader_to_sink(reader, tx));
+        tokio::task::spawn_local(aux_reader_to_sink(reader, tx).then(move |_| {
+            net_unregister(ctx.net, ctx.desc)
+                .map_err(|e| log::error!("{e}"))
+                .then(|_| futures::future::ready(()))
+        }));
         tokio::task::spawn_local(aux_stream_to_writer(rx, writer));
 
         Ok::<_, Error>(())
@@ -119,7 +123,7 @@ where
                 }
             }
             Err(e) => {
-                log::error!("Reader to sink channel error: {e}");
+                log::error!("[proxy] reader to sink channel error: {e}");
                 break;
             }
         }
@@ -138,7 +142,7 @@ where
                 Ok(0) => break,
                 Ok(n) => idx += n,
                 Err(e) => {
-                    log::error!("Stream to writer channel error: {e}");
+                    log::error!("[proxy] stream to writer channel error: {e}");
                     break;
                 }
             }
@@ -172,6 +176,19 @@ async fn net_register(net: Addr<Network>, desc: SocketDesc) -> Result<(Connectio
         ))),
         Err(_) => Err(Error::Network(format!(
             "Cannot add connection {desc:?}: virtual network not started"
+        ))),
+    }
+}
+
+// helper: closes a TCP connection using the `Network` actor
+async fn net_unregister(net: Addr<Network>, desc: SocketDesc) -> Result<()> {
+    match net.send(Unregister { desc }).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(Error::Network(format!(
+            "Error disconnecting from {desc:?}: {e}"
+        ))),
+        Err(_) => Err(Error::Network(format!(
+            "Cannot disconnect from {desc:?}: virtual network not started"
         ))),
     }
 }
