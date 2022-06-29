@@ -121,7 +121,7 @@ impl VirtualNetwork {
                 let state = conn.state.borrow();
                 match &*state {
                     ConnectionState::Established(_, channels) => return Some(f(channels)),
-                    _ => log::info!("Connection to {:?} is in invalid state", desc),
+                    _ => log::warn!("Connection: invalid state {desc:?}"),
                 }
             }
             _ => log::error!("Unable to route ingress packet: no connection"),
@@ -170,7 +170,7 @@ impl VirtualNetwork {
 
         async move {
             let mut conn =
-                conn.ok_or_else(|| Error::Network(format!("Connection {:?} not found", desc)))?;
+                conn.ok_or_else(|| Error::Network(format!("Connection {desc:?} not found")))?;
 
             let lock = match conn.lock() {
                 Some(lock) => lock,
@@ -226,24 +226,24 @@ impl VirtualNetwork {
         while let Some(evt) = rx.recv().await {
             let (desc, payload) = match evt {
                 IngressEvent::InboundConnection { desc } => {
-                    log::info!("Ingress: connection from {:?}", desc);
+                    log::info!("Ingress: connection from {desc:?}");
                     continue;
                 }
                 IngressEvent::Disconnected { desc } => {
-                    log::info!("Ingress: disconnected from {:?}", desc);
+                    log::info!("Ingress: disconnected from {desc:?}");
                     continue;
                 }
                 IngressEvent::Packet { desc, payload } => (desc, payload),
             };
 
-            log::info!("Ingress: packet from {:?}: {:?}", desc, payload);
+            log::info!("Ingress: packet from {desc:?}: {payload:?}");
 
             if let Some(mut tx) = self.get_channel(&desc, |c| c.ingress.tx.clone()) {
                 if let Err(e) = tx.send(payload).await {
                     log::error!("Ingress: unable to route packet: {e}");
                 }
             } else {
-                log::error!("Ingress: no connection to {:?}", desc);
+                log::error!("Ingress: no connection to {desc:?}");
             }
         }
     }
