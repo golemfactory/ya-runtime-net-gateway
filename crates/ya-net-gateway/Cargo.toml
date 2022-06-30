@@ -1,0 +1,29 @@
+[package]
+name = "ya-net-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ya-net-gateway"
+path = "src/bin.rs"
+required-features = ["bin"]
+
+[features]
+default = []
+bin = []
+
+[dependencies]
+ya-relay-stack = { git = "https://github.com/golemfactory/ya-relay.git", rev = "383edfba754883d705621cec5ed72fca512269a1" }
+
+actix = "0.13"
+actix-rt = "2.7"
+actix-web = "4"
+anyhow = "1"
+clap = { version = "3.2", features = ["derive"] }
+env_logger = "0.9"
+futures = "0.3"
+hex = "0.4"
+log = "0.4"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
