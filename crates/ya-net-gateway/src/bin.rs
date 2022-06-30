@@ -1,5 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use actix::{Actor, Addr};
@@ -166,7 +166,84 @@ where
     }
 }
 
-// helper: creates TCP connection communication channels via `Network` actor
+async fn udp_forwarder(
+    net: Addr<Network>,
+    routes: Routes,
+    local: SocketAddr,
+    socket: tokio::net::UdpSocket,
+) {
+    let remote = match routes.get(local).await {
+        Some(addr) => addr,
+        None => {
+            log::error!("Forward destination not found for {local}");
+            return;
+        }
+    };
+
+    let desc = SocketDesc {
+        protocol: Protocol::Udp,
+        local: local.into(),
+        remote: remote.into(),
+    };
+
+    let _ = async move {
+        let (channels, _) = net_register(net.clone(), desc).await?;
+        net_connect(net, desc).await?;
+
+        let mut tx = channels.send.sender();
+        let mut rx = channels
+            .ingress
+            .receiver()
+            .ok_or_else(|| Error::Network("Ingress UDP channel already taken".to_string()))?;
+
+        let socket_recv = Arc::new(socket);
+        let socket_send = socket_recv.clone();
+
+        tokio::task::spawn_local(async move {
+            let mut buf = [0u8; READER_BUFFER_SIZE];
+            loop {
+                match socket_recv.recv(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("[proxy] reader to sink channel error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        tokio::task::spawn_local(async move {
+            while let Some(vec) = rx.next().await {
+                let mut idx = 0 as usize;
+                loop {
+                    match socket_send.send(&vec[idx..]).await {
+                        Ok(0) => break,
+                        Ok(n) => idx += n,
+                        Err(e) => {
+                            log::error!("[proxy] stream to writer channel error: {e}");
+                            break;
+                        }
+                    }
+                    if idx >= vec.len() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok::<_, Error>(())
+    }
+    .map_err(|e| log::error!("{e}"))
+    .await;
+}
+
+
+// helper: creates TCP connection or UDP "connection" communication channels via `Network` actor
 // this is done BEFORE connecting so that we can exchange any prior traffic
 // (e.g. ARP requests / responses)
 async fn net_register(net: Addr<Network>, desc: SocketDesc) -> Result<(ConnectionChannels, bool)> {
@@ -195,6 +272,8 @@ async fn net_unregister(net: Addr<Network>, desc: SocketDesc) -> Result<()> {
 }
 
 // helper: establishes a TCP connection using the `Network` actor
+// also, it establishes UDP "connection" in the sense that we forward all relevant UDP packets to
+// a certain endpoint in `Network`
 async fn net_connect(net: Addr<Network>, desc: SocketDesc) -> Result<()> {
     match net.send(Connect { desc }).await {
         Ok(Ok(_)) => Ok(()),
@@ -227,11 +306,12 @@ where
 struct WebData {
     prev_id: u32,
     routes_tcp: Routes,
+    routes_udp: Routes,
     net: Addr<Network>,
 }
 
 #[derive(serde::Deserialize)]
-struct TcpConnectRequest {
+struct TcpUdpConnectRequest {
     // XXX this probably needs only port! allowing IP address could be an oracle if the real IP
     // address (internal, after NAT) needs to remain confidential
 	listen: String,
@@ -241,12 +321,14 @@ struct TcpConnectRequest {
 }
 
 #[derive(serde::Serialize)]
-struct TcpConnectResponse {
+struct TcpUdpConnectResponse {
     id: u32,
 }
 
 #[post("/tcp")]
-async fn tcp_post(data: web::Data<Mutex<WebData>>, req: web::Json<TcpConnectRequest>) -> actix_web::Result<actix_web::HttpResponse> {
+async fn tcp_post(
+    data: web::Data<Mutex<WebData>>, req: web::Json<TcpUdpConnectRequest>
+) -> actix_web::Result<actix_web::HttpResponse> {
     let mut data = data.lock().unwrap();
     data.prev_id += 1;
 
@@ -269,10 +351,10 @@ async fn tcp_post(data: web::Data<Mutex<WebData>>, req: web::Json<TcpConnectRequ
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
 
-    log::info!("[proxy] listening on {}", listen);
+    log::info!("[proxy] listening on {}/tcp", listen);
     tokio::task::spawn_local(tcp_acceptor(data.net.clone(), data.routes_tcp.clone(), listen, listener));
 
-    Ok(actix_web::HttpResponse::Ok().json(TcpConnectResponse { id: data.prev_id }))
+    Ok(actix_web::HttpResponse::Ok().json(TcpUdpConnectResponse { id: data.prev_id }))
 }
 
 #[derive(serde::Serialize)]
@@ -288,6 +370,38 @@ async fn tcp_delete(data: web::Data<Mutex<WebData>>, path: web::Path<(u32,)>) ->
     log::debug!("close: {:?}", id);
 
     Ok(actix_web::HttpResponse::Ok().json(TcpDisconnectResponse {}))
+}
+
+#[post("/udp")]
+async fn udp_post(
+    data: web::Data<Mutex<WebData>>, req: web::Json<TcpUdpConnectRequest>
+) -> actix_web::Result<actix_web::HttpResponse> {
+    let mut data = data.lock().unwrap();
+    data.prev_id += 1;
+
+    let listen: SocketAddr;
+    match req.listen.parse() {
+        Ok(l) => listen = l,
+        Err(e) => return Ok(actix_web::HttpResponse::BadRequest().body(format!("listen: {e}"))),
+    };
+
+    let remote: SocketAddr;
+    match req.remote.parse() {
+        Ok(r) => remote = r,
+        Err(e) => return Ok(actix_web::HttpResponse::BadRequest().body(format!("remote: {e}"))),
+    };
+
+    log::debug!("listen: {listen:?} remote: {remote:?}");
+
+    // XXX this badly needs error handling in case `listen` is duplicated
+    data.routes_udp.add(listen, remote).await;
+
+    let socket = tokio::net::UdpSocket::bind(listen).await?;
+
+    log::info!("[proxy] listening on {}/udp", listen);
+    tokio::task::spawn_local(udp_forwarder(data.net.clone(), data.routes_udp.clone(), listen, socket));
+
+    Ok(actix_web::HttpResponse::Ok().json(TcpUdpConnectResponse { id: data.prev_id }))
 }
 
 #[get("/metrics")]
@@ -395,6 +509,7 @@ async fn main() -> anyhow::Result<()> {
     let data = web::Data::new(Mutex::new(WebData {
 		prev_id: 0,
         routes_tcp: Routes::default(),
+        routes_udp: Routes::default(),
         net: tokio::time::timeout(NET_SPAWN_TIMEOUT, rx_addr).await??,
     }));
 
@@ -403,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
             .app_data(data.clone())
             .service(tcp_post)
             .service(tcp_delete)
+            .service(udp_post)
             .service(metrics)
     })
     .bind(("127.0.0.1", 8000)).expect("failet do bind()")
