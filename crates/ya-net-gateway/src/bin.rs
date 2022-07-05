@@ -555,10 +555,12 @@ async fn main() -> anyhow::Result<()> {
     actix_web::HttpServer::new(move || {
         actix_web::App::new()
             .app_data(data.clone())
+            .service(web::scope("/status-api/v1")
+                .service(metrics)
+            )
             .service(tcp_post)
             .service(tcp_delete)
             .service(udp_post)
-            .service(metrics)
     })
     .bind(("127.0.0.1", 8000)).expect("failet do bind()")
     .run()
