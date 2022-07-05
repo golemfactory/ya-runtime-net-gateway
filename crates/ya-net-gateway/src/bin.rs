@@ -9,6 +9,8 @@ use actix_web::{web, get, post, delete};
 use clap::Parser;
 use futures::channel::oneshot;
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryFutureExt};
+use lazy_static::lazy_static;
+use prometheus::{self, Encoder};
 use serde;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -36,6 +38,30 @@ const READER_BUFFER_SIZE: usize = 2048;
 struct Args {
 }
 
+lazy_static! {
+    pub static ref yaproxy_receive_bytes_total: prometheus::IntCounterVec =
+        prometheus::register_int_counter_vec!(
+            "yaproxy_receive_bytes_total",
+            "Number of octects received from the Internet and forwarded to VPN",
+            &["id"],
+        ).unwrap();
+
+    pub static ref yaproxy_transmit_bytes_total: prometheus::IntCounterVec =
+        prometheus::register_int_counter_vec!(
+            "yaproxy_network_transmit_bytes_total",
+            "Number of octects received from the VPN and transmitted to the Internet",
+            &["id"],
+        ).unwrap();
+
+    pub static ref yaproxy_connections: prometheus::GaugeVec =
+        prometheus::register_gauge_vec!(
+            "yaproxy_connections",
+            "Number of active connections",
+            &["proto"],
+        ).unwrap();
+}
+
+
 struct ForwardContext {
     net: Addr<Network>,
     #[allow(unused)]
@@ -48,6 +74,7 @@ pub async fn tcp_acceptor(
     routes: Routes,
     local: SocketAddr,
     listener: tokio::net::TcpListener,
+    id: u32,
 ) {
     loop {
         let (stream, from) = match listener.accept().await {
@@ -78,11 +105,11 @@ pub async fn tcp_acceptor(
             },
         };
 
-        tokio::task::spawn_local(tcp_forwarder(ctx, stream));
+        tokio::task::spawn_local(tcp_forwarder(ctx, stream, id));
     }
 }
 
-async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream) {
+async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream, id: u32) {
     let _ = async move {
         // overwrite existing entries for TCP
         let (channels, _) = net_register(ctx.net.clone(), ctx.desc).await?;
@@ -96,12 +123,12 @@ async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream) {
 
         let (reader, writer) = tokio::io::split(stream);
 
-        tokio::task::spawn_local(aux_reader_to_sink(reader, tx).then(move |_| {
+        tokio::task::spawn_local(aux_reader_to_sink(reader, tx, id).then(move |_| {
             net_unregister(ctx.net, ctx.desc)
                 .map_err(|e| log::error!("{e}"))
                 .then(|_| futures::future::ready(()))
         }));
-        tokio::task::spawn_local(aux_stream_to_writer(rx, writer));
+        tokio::task::spawn_local(aux_stream_to_writer(rx, writer, id));
 
         Ok::<_, Error>(())
     }
@@ -109,7 +136,7 @@ async fn tcp_forwarder(ctx: ForwardContext, stream: TcpStream) {
     .await;
 }
 
-pub async fn aux_reader_to_sink<S, E, T>(mut reader: ReadHalf<T>, mut tx: S)
+pub async fn aux_reader_to_sink<S, E, T>(mut reader: ReadHalf<T>, mut tx: S, id: u32)
 where
     S: Sink<Vec<u8>, Error = E> + Unpin,
     T: AsyncRead,
@@ -121,6 +148,8 @@ where
             Ok(n) => {
                 if tx.send(buf[..n].to_vec()).await.is_err() {
                     break;
+                } else {
+                    yaproxy_transmit_bytes_total.with_label_values(&[&id.to_string()]).inc_by(n as u64);
                 }
             }
             Err(e) => {
@@ -131,7 +160,7 @@ where
     }
 }
 
-async fn aux_stream_to_writer<S, T>(mut rx: S, mut writer: WriteHalf<T>)
+async fn aux_stream_to_writer<S, T>(mut rx: S, mut writer: WriteHalf<T>, id: u32)
 where
     S: Stream<Item = Vec<u8>> + Unpin,
     T: AsyncWrite,
@@ -141,7 +170,10 @@ where
         loop {
             match writer.write(&vec[idx..]).await {
                 Ok(0) => break,
-                Ok(n) => idx += n,
+                Ok(n) => {
+                    idx += n;
+                    yaproxy_receive_bytes_total.with_label_values(&[&id.to_string()]).inc_by(n as u64);
+                },
                 Err(e) => {
                     log::error!("[proxy] stream to writer channel error: {e}");
                     break;
@@ -171,6 +203,7 @@ async fn udp_forwarder(
     routes: Routes,
     local: SocketAddr,
     socket: tokio::net::UdpSocket,
+    id: u32,
 ) {
     let remote = match routes.get(local).await {
         Some(addr) => addr,
@@ -207,6 +240,8 @@ async fn udp_forwarder(
                     Ok(n) => {
                         if tx.send(buf[..n].to_vec()).await.is_err() {
                             break;
+                        } else {
+                            yaproxy_receive_bytes_total.with_label_values(&[&id.to_string()]).inc_by(n as u64);
                         }
                     }
                     Err(e) => {
@@ -223,7 +258,10 @@ async fn udp_forwarder(
                 loop {
                     match socket_send.send(&vec[idx..]).await {
                         Ok(0) => break,
-                        Ok(n) => idx += n,
+                        Ok(n) => {
+                            idx += n;
+                            yaproxy_transmit_bytes_total.with_label_values(&[&id.to_string()]).inc_by(n as u64);
+                        },
                         Err(e) => {
                             log::error!("[proxy] stream to writer channel error: {e}");
                             break;
@@ -345,6 +383,7 @@ async fn tcp_post(
     };
 
     log::debug!("listen: {listen:?} remote: {remote:?}");
+    yaproxy_connections.with_label_values(&["tcp"]).inc();
 
     // XXX this badly needs error handling in case `listen` is duplicated
     data.routes_tcp.add(listen, remote).await;
@@ -352,7 +391,7 @@ async fn tcp_post(
     let listener = tokio::net::TcpListener::bind(listen).await?;
 
     log::info!("[proxy] listening on {}/tcp", listen);
-    tokio::task::spawn_local(tcp_acceptor(data.net.clone(), data.routes_tcp.clone(), listen, listener));
+    tokio::task::spawn_local(tcp_acceptor(data.net.clone(), data.routes_tcp.clone(), listen, listener, data.prev_id));
 
     Ok(actix_web::HttpResponse::Ok().json(TcpUdpConnectResponse { id: data.prev_id }))
 }
@@ -368,6 +407,7 @@ async fn tcp_delete(data: web::Data<Mutex<WebData>>, path: web::Path<(u32,)>) ->
     let (id,) = path.into_inner();
 
     log::debug!("close: {:?}", id);
+    yaproxy_connections.with_label_values(&["tcp"]).dec();
 
     Ok(actix_web::HttpResponse::Ok().json(TcpDisconnectResponse {}))
 }
@@ -392,6 +432,7 @@ async fn udp_post(
     };
 
     log::debug!("listen: {listen:?} remote: {remote:?}");
+    yaproxy_connections.with_label_values(&["udp"]).inc();
 
     // XXX this badly needs error handling in case `listen` is duplicated
     data.routes_udp.add(listen, remote).await;
@@ -399,19 +440,17 @@ async fn udp_post(
     let socket = tokio::net::UdpSocket::bind(listen).await?;
 
     log::info!("[proxy] listening on {}/udp", listen);
-    tokio::task::spawn_local(udp_forwarder(data.net.clone(), data.routes_udp.clone(), listen, socket));
+    tokio::task::spawn_local(udp_forwarder(data.net.clone(), data.routes_udp.clone(), listen, socket, data.prev_id));
 
     Ok(actix_web::HttpResponse::Ok().json(TcpUdpConnectResponse { id: data.prev_id }))
 }
 
 #[get("/metrics")]
 async fn metrics(data: web::Data<Mutex<WebData>>) -> String {
-    format!("\
-        TODO_metrics{{iface=\"1\"}} {}\n\
-        TODO_metrics{{iface=\"2\"}} {}\n\
-    ", 1, 2)
+    let mut buffer = vec![];
+    prometheus::TextEncoder::new().encode(&prometheus::gather(), &mut buffer).unwrap();
+    String::from_utf8(buffer).unwrap()
 }
-
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
