@@ -14,6 +14,7 @@ bin = []
 
 [dependencies]
 ya-relay-stack = { git = "https://github.com/golemfactory/ya-relay.git", rev = "383edfba754883d705621cec5ed72fca512269a1" }
+ya-net-gateway-model = { version = "0.1", path = "../ya-net-gateway-model" }
 
 actix = "0.13"
 actix-rt = "2.7"

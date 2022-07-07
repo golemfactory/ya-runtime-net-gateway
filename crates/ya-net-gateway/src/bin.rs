@@ -11,7 +11,6 @@ use futures::channel::oneshot;
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryFutureExt};
 use lazy_static::lazy_static;
 use prometheus::{self, Encoder};
-use serde;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
@@ -20,6 +19,7 @@ use ya_net_gateway::network::virt::{Channel, ConnectionChannels, VirtualNetworkC
 use ya_net_gateway::network::{Connect, Network, Register, Routes, Unregister};
 use ya_relay_stack::smoltcp::wire;
 use ya_relay_stack::{Protocol, SocketDesc};
+use ya_net_gateway_model::{CreateTcpUdp, TcpUdp};
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -342,33 +342,17 @@ where
  */
 
 struct WebData {
-    prev_id: u32,
     routes_tcp: Routes,
     routes_udp: Routes,
     net: Addr<Network>,
 }
 
-#[derive(serde::Deserialize)]
-struct TcpUdpConnectRequest {
-    // XXX this probably needs only port! allowing IP address could be an oracle if the real IP
-    // address (internal, after NAT) needs to remain confidential
-	listen: String,
-
-    // XXX rename to "forward"?
-    remote: String,
-}
-
-#[derive(serde::Serialize)]
-struct TcpUdpConnectResponse {
-    id: u32,
-}
-
 #[post("/tcp")]
 async fn tcp_post(
-    data: web::Data<Mutex<WebData>>, req: web::Json<TcpUdpConnectRequest>
+    data: web::Data<Mutex<WebData>>, req: web::Json<CreateTcpUdp>
 ) -> actix_web::Result<actix_web::HttpResponse> {
     let mut data = data.lock().unwrap();
-    data.prev_id += 1;
+    let id = ya_net_gateway_model::next_id();
 
     let listen: SocketAddr;
     match req.listen.parse() {
@@ -391,14 +375,9 @@ async fn tcp_post(
     let listener = tokio::net::TcpListener::bind(listen).await?;
 
     log::info!("[proxy] listening on {}/tcp", listen);
-    tokio::task::spawn_local(tcp_acceptor(data.net.clone(), data.routes_tcp.clone(), listen, listener, data.prev_id));
+    tokio::task::spawn_local(tcp_acceptor(data.net.clone(), data.routes_tcp.clone(), listen, listener, id));
 
-    Ok(actix_web::HttpResponse::Ok().json(TcpUdpConnectResponse { id: data.prev_id }))
-}
-
-#[derive(serde::Serialize)]
-struct TcpDisconnectResponse {
-    // TODO
+    Ok(actix_web::HttpResponse::Ok().json(TcpUdp { id: id }))
 }
 
 #[delete("/tcp/{id}")]
@@ -409,15 +388,15 @@ async fn tcp_delete(data: web::Data<Mutex<WebData>>, path: web::Path<(u32,)>) ->
     log::debug!("close: {:?}", id);
     yaproxy_connections.with_label_values(&["tcp"]).dec();
 
-    Ok(actix_web::HttpResponse::Ok().json(TcpDisconnectResponse {}))
+    Ok(actix_web::HttpResponse::Ok().json(()))
 }
 
 #[post("/udp")]
 async fn udp_post(
-    data: web::Data<Mutex<WebData>>, req: web::Json<TcpUdpConnectRequest>
+    data: web::Data<Mutex<WebData>>, req: web::Json<CreateTcpUdp>
 ) -> actix_web::Result<actix_web::HttpResponse> {
     let mut data = data.lock().unwrap();
-    data.prev_id += 1;
+    let id = ya_net_gateway_model::next_id();
 
     let listen: SocketAddr;
     match req.listen.parse() {
@@ -440,9 +419,9 @@ async fn udp_post(
     let socket = tokio::net::UdpSocket::bind(listen).await?;
 
     log::info!("[proxy] listening on {}/udp", listen);
-    tokio::task::spawn_local(udp_forwarder(data.net.clone(), data.routes_udp.clone(), listen, socket, data.prev_id));
+    tokio::task::spawn_local(udp_forwarder(data.net.clone(), data.routes_udp.clone(), listen, socket, id));
 
-    Ok(actix_web::HttpResponse::Ok().json(TcpUdpConnectResponse { id: data.prev_id }))
+    Ok(actix_web::HttpResponse::Ok().json(TcpUdp { id: id }))
 }
 
 #[get("/metrics")]
@@ -546,7 +525,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let data = web::Data::new(Mutex::new(WebData {
-		prev_id: 0,
         routes_tcp: Routes::default(),
         routes_udp: Routes::default(),
         net: tokio::time::timeout(NET_SPAWN_TIMEOUT, rx_addr).await??,
