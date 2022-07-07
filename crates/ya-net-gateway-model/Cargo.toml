@@ -1,9 +1,9 @@
 [package]
-name = "ya-http-proxy-model"
-description = "HTTP authentication runtime and ya-http-proxy data model"
+name = "ya-net-gateway-model"
+description = "HTTP authentication runtime and ya-net-gateway data model"
 authors = ["Golem Factory <contact@golem.network>"]
-homepage = "https://github.com/golemfactory/ya-runtime-http-auth"
-repository = "https://github.com/golemfactory/ya-runtime-http-auth"
+homepage = "https://github.com/golemfactory/ya-runtime-net-gateway"
+repository = "https://github.com/golemfactory/ya-runtime-net-gateway"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0"
