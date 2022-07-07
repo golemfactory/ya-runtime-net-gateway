@@ -1,15 +1,15 @@
 [package]
-name = "ya-http-proxy-client"
-description = "ya-http-proxy Management API client"
+name = "ya-net-gateway-client"
+description = "ya-net-gateway Management API client"
 authors = ["Golem Factory <contact@golem.network>"]
-homepage = "https://github.com/golemfactory/ya-runtime-http-auth"
-repository = "https://github.com/golemfactory/ya-runtime-http-auth"
+homepage = "https://github.com/golemfactory/ya-runtime-net-gateway"
+repository = "https://github.com/golemfactory/ya-runtime-net-gateway"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0"
 
 [dependencies]
-ya-http-proxy-model = { version = "0.1", path = "../ya-http-proxy-model"}
+ya-net-gateway-model = { version = "0.1", path = "../ya-net-gateway-model"}
 
 actix-http = {version = "1" }
 anyhow = { version = "1" }

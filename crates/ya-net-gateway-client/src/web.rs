@@ -2,9 +2,9 @@ use http::{Method, Uri};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
-use ya_http_proxy_model::ErrorResponse;
+use ya_net_gateway_model::ErrorResponse;
 
-pub const DEFAULT_MANAGEMENT_API_URL: &str = "http://127.0.0.1:6668";
+pub const DEFAULT_MANAGEMENT_API_URL: &str = "http://127.0.0.1:8000"; // FIXME port number
 const MAX_BODY_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
