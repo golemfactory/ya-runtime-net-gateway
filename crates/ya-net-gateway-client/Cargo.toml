@@ -1,0 +1,22 @@
+[package]
+name = "ya-http-proxy-client"
+description = "ya-http-proxy Management API client"
+authors = ["Golem Factory <contact@golem.network>"]
+homepage = "https://github.com/golemfactory/ya-runtime-http-auth"
+repository = "https://github.com/golemfactory/ya-runtime-http-auth"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+
+[dependencies]
+ya-http-proxy-model = { version = "0.1", path = "../ya-http-proxy-model"}
+
+actix-http = {version = "1" }
+anyhow = { version = "1" }
+awc = { version = "1" }
+chrono = { version = "0.4", features = ["serde"] }
+http = { version = "0.2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+log = { version ="0.4" }
+thiserror = {version ="1.0"}
