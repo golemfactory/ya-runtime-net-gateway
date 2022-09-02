@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,9 +18,10 @@ use tokio::net::TcpStream;
 use ya_net_gateway::error::{Error, Result};
 use ya_net_gateway::network::virt::{Channel, ConnectionChannels, VirtualNetworkConfig};
 use ya_net_gateway::network::{Connect, Network, Register, Routes, Unregister};
+use ya_net_gateway::probe::probe;
 use ya_relay_stack::smoltcp::wire;
 use ya_relay_stack::{Protocol, SocketDesc};
-use ya_net_gateway_model::{CreateTcpUdp, TcpUdp};
+use ya_net_gateway_model::{CreateTcpUdp, TcpUdp, CreateProbe, Probe};
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -345,6 +347,7 @@ struct WebData {
     routes_tcp: Routes,
     routes_udp: Routes,
     net: Addr<Network>,
+    probes: HashMap<u32, tokio::sync::oneshot::Sender<()>>,
 }
 
 #[post("/tcp")]
@@ -424,12 +427,59 @@ async fn udp_post(
     Ok(actix_web::HttpResponse::Ok().json(TcpUdp { id: id }))
 }
 
+/*
+ * metrics API
+ */
+
 #[get("/metrics")]
 async fn metrics(data: web::Data<Mutex<WebData>>) -> String {
     let mut buffer = vec![];
     prometheus::TextEncoder::new().encode(&prometheus::gather(), &mut buffer).unwrap();
     String::from_utf8(buffer).unwrap()
 }
+
+/*
+ * probe API
+ */
+
+#[post("/tcp")]
+async fn probe_create_tcp(
+    data: web::Data<Mutex<WebData>>, req: web::Json<CreateProbe>
+) -> actix_web::Result<actix_web::HttpResponse> {
+    let mut data = data.lock().unwrap();
+    let listen: SocketAddr;
+    match req.listen.parse() {
+        Ok(l) => listen = l,
+        Err(e) => return Ok(actix_web::HttpResponse::BadRequest().body(format!("listen: {e}"))),
+    };
+
+    let id = ya_net_gateway_model::next_id();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    data.probes.insert(id, tx);
+    tokio::task::spawn_local(probe(req.token, listen, rx));
+
+    Ok(actix_web::HttpResponse::Ok().json(Probe { id: id }))
+}
+
+#[delete("/tcp/{id}")]
+async fn probe_delete_tcp(
+    data: web::Data<Mutex<WebData>>, path: web::Path<(u32,)>
+) -> actix_web::Result<actix_web::HttpResponse> {
+    let mut data = data.lock().unwrap();
+    let (id,) = path.into_inner();
+    match data.probes.remove(&id) {
+        Some(tx) => {
+            tx.send(());
+            Ok(actix_web::HttpResponse::Ok().finish())
+        }
+        None => Ok(actix_web::HttpResponse::BadRequest().body(format!("no such id: {id}")))
+    }
+}
+
+
+/*
+ * main thread
+ */
 
 #[actix_rt::main]
 async fn main() -> anyhow::Result<()> {
@@ -528,6 +578,7 @@ async fn main() -> anyhow::Result<()> {
         routes_tcp: Routes::default(),
         routes_udp: Routes::default(),
         net: tokio::time::timeout(NET_SPAWN_TIMEOUT, rx_addr).await??,
+        probes: HashMap::default(),
     }));
 
     actix_web::HttpServer::new(move || {
@@ -535,6 +586,10 @@ async fn main() -> anyhow::Result<()> {
             .app_data(data.clone())
             .service(web::scope("/status-api/v1")
                 .service(metrics)
+            )
+            .service(web::scope("/probe-api/v1")
+                .service(probe_create_tcp)
+                .service(probe_delete_tcp)
             )
             .service(tcp_post)
             .service(tcp_delete)
