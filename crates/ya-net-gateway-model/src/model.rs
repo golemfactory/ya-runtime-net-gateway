@@ -22,3 +22,16 @@ pub fn next_id() -> u32 {
     let id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
     id
 }
+
+pub type ProbeToken = [u8; 32];
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct CreateProbe {
+    pub token: ProbeToken,
+    pub listen: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct Probe {
+    pub id: u32,
+}
